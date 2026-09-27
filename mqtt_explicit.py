@@ -1,80 +1,79 @@
+import asyncio
 import time
 import json
+import random
+import ssl
 import base64
 import hmac
 import hashlib
 import urllib.parse
-import ssl
+from azure.iot.device.aio import ProvisioningDeviceClient
 import paho.mqtt.client as mqtt
-from azure.iot.device import ProvisioningDeviceClient
 
-# --- CREDENCIALES EXACTAS DE TU MENSAJE ---
-ID_SCOPE = "0ne010B81EB"
+SCOPE_ID = "0ne010B81EB"
 DEVICE_ID = "26a1012qbj0"
-PRIMARY_KEY = "d6ODIUmamaN88mljj0DeC605Rvho65ymOTrzR3CAhkg="
+DEVICE_KEY = "d6ODIUmamaN88mljj0DeC605Rvho65ymOTrzR3CAhkg="
+PROVISIONING_HOST = "global.azure-devices-provisioning.net"
 
-# 1. Obtención del IoT Hub mediante DPS
-print(f"Obteniendo IoT Hub para {DEVICE_ID}...")
-prov_client = ProvisioningDeviceClient.create_from_symmetric_key(
-    provisioning_host="global.azure-devices-provisioning.net",
-    registration_id=DEVICE_ID,
-    id_scope=ID_SCOPE,
-    symmetric_key=PRIMARY_KEY,
-)
+async def get_assigned_hub():
+    print(f"[DPS] Aprovisionando {DEVICE_ID} para obtener el Hub asignado...")
+    provisioning_client = ProvisioningDeviceClient.create_from_symmetric_key(
+        provisioning_host=PROVISIONING_HOST,
+        registration_id=DEVICE_ID,
+        id_scope=SCOPE_ID,
+        symmetric_key=DEVICE_KEY
+    )
+    results = await provisioning_client.register()
+    if results.status == "assigned":
+        hub = results.registration_state.assigned_hub
+        print(f"-> ¡DPS Éxito! Hub asignado: {hub}")
+        return hub
+    else:
+        raise Exception(f"Fallo en DPS: {results.status}")
 
-reg_result = prov_client.register()
-IOT_HUB_HOSTNAME = reg_result.registration_state.assigned_hub
-PORT = 8883
-print(f"-> ¡ÉXITO! IoT Hub resuelto: {IOT_HUB_HOSTNAME}")
-
-# 2. Generación del token SAS para Paho MQTT
 def generate_sas_token(uri, key, expiry=3600):
     ttl = int(time.time()) + expiry
     sign_key = base64.b64decode(key)
     to_sign = f"{urllib.parse.quote_plus(uri)}\n{ttl}".encode('utf-8')
-    signature = hmac.new(sign_key, to_sign, hashlib.sha256).digest()
-    raw_sig = base64.b64encode(signature).decode('utf-8')
-    return f"SharedAccessSignature sr={urllib.parse.quote_plus(uri)}&sig={urllib.parse.quote_plus(raw_sig)}&se={ttl}"
+    raw_hmac = hmac.HMAC(sign_key, to_sign, hashlib.sha256).digest()
+    signature = urllib.parse.quote_plus(base64.b64encode(raw_hmac))
+    return f"SharedAccessSignature sr={urllib.parse.quote_plus(uri)}&sig={signature}&se={ttl}"
 
-username = f"{IOT_HUB_HOSTNAME}/{DEVICE_ID}/?api-version=2021-04-12"
-password = generate_sas_token(f"{IOT_HUB_HOSTNAME}/devices/{DEVICE_ID}", PRIMARY_KEY)
-telemetry_topic = f"devices/{DEVICE_ID}/messages/events/"
+def run_mqtt(hostname):
+    username = f"{hostname}/{DEVICE_ID}/?api-version=2021-04-12"
+    password = generate_sas_token(f"{hostname}/devices/{DEVICE_ID}", DEVICE_KEY)
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("\n[MQTT Explícito] ¡Conectado correctamente a Azure IoT Central!")
-    else:
-        print(f"\n[MQTT Explícito] Error de conexión: {rc}")
+    client = mqtt.Client(client_id=DEVICE_ID, protocol=mqtt.MQTTv311)
+    client.username_pw_set(username=username, password=password)
+    client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
 
-def on_publish(client, userdata, mid):
-    print(f"[MQTT Explícito] Telemetría enviada a Azure (MID: {mid})")
+    def on_connect(client, userdata, flags, rc):
+        if rc == 0:
+            print(f"\n--- [CAMINO 2: MQTT EXPLÍCITO] CONECTADO EXITOSAMENTE (rc={rc}) ---")
+        else:
+            print(f"\n--- [CAMINO 2: MQTT EXPLÍCITO] ERROR DE CONEXIÓN (rc={rc}) ---")
 
-# 3. Configuración del cliente MQTT
-client = mqtt.Client(client_id=DEVICE_ID, protocol=mqtt.MQTTv311)
-client.username_pw_set(username=username, password=password)
-client.tls_set(tls_version=ssl.PROTOCOL_TLSv1_2)
+    client.on_connect = on_connect
+    client.connect(hostname, 8883, keepalive=60)
+    client.loop_start()
 
-client.on_connect = on_connect
-client.on_publish = on_publish
+    time.sleep(2)
+    try:
+        while True:
+            telemetria = {
+                "temperatura": round(random.uniform(20.0, 26.0), 1),
+                "humedad": round(random.uniform(50.0, 65.0), 1),
+                "voltaje": round(random.uniform(3.1, 3.3), 2)
+            }
+            payload = json.dumps(telemetria)
+            topic = f"devices/{DEVICE_ID}/messages/events/"
+            info = client.publish(topic, payload, qos=1)
+            print(f"-> [MQTT Explícito - {DEVICE_ID}] Telemetría enviada (MID: {info.mid}): {payload}")
+            time.sleep(10)
+    except KeyboardInterrupt:
+        client.loop_stop()
+        client.disconnect()
 
-print(f"Conectando a {IOT_HUB_HOSTNAME}:{PORT}...")
-client.connect(IOT_HUB_HOSTNAME, PORT, keepalive=60)
-client.loop_start()
-
-try:
-    contador = 0
-    while True:
-        payload = {
-            "temperatura": round(21.0 + (contador % 6) * 0.5, 2),
-            "humedad": round(50.0 + (contador % 4) * 1.5, 2),
-            "voltaje": round(3.3 - (contador % 3) * 0.1, 2)
-        }
-        json_data = json.dumps(payload)
-        client.publish(telemetry_topic, json_data, qos=1)
-        print(f"-> Publicando: {json_data}")
-        contador += 1
-        time.sleep(10)
-except KeyboardInterrupt:
-    print("\nDeteniendo...")
-    client.loop_stop()
-    client.disconnect()
+if __name__ == "__main__":
+    assigned_hub = asyncio.run(get_assigned_hub())
+    run_mqtt(assigned_hub)
